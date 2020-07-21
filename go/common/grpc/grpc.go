@@ -236,8 +236,8 @@ func newGrpcLogAdapter(baseLogger *logging.Logger) *grpcLogAdapter {
 	return &grpcLogAdapter{
 		logger:    logging.GetLoggerEx("grpc", 2),
 		reqLogger: baseLogger,
-		verbosity: 2,
-		isDebug:   logging.GetLevel() == logging.LevelDebug && logDebug,
+		verbosity: 99,
+		isDebug:   true,
 	}
 }
 

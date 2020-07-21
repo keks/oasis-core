@@ -18,7 +18,6 @@ import (
 	"github.com/oasisprotocol/oasis-core/go/common/entity"
 	"github.com/oasisprotocol/oasis-core/go/common/logging"
 	"github.com/oasisprotocol/oasis-core/go/common/node"
-	"github.com/oasisprotocol/oasis-core/go/common/quantity"
 	consensus "github.com/oasisprotocol/oasis-core/go/consensus/api"
 	"github.com/oasisprotocol/oasis-core/go/consensus/api/transaction/results"
 	tmcrypto "github.com/oasisprotocol/oasis-core/go/consensus/tendermint/crypto"
@@ -186,30 +185,6 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 		"height", height,
 	)
 
-	epoch, err := q.consensus.GetEpoch(ctx, height)
-	if err != nil {
-		return fmt.Errorf("GetEpoch at height %d: %w", height, err)
-	}
-	block, err := q.consensus.GetBlock(ctx, height)
-	if err != nil {
-		return fmt.Errorf("GetBlock at height %d: %w", height, err)
-	}
-	if block.Height != height {
-		return fmt.Errorf("block.Height: %d == %d violated", block.Height, height)
-	}
-	if !q.epochtimeParams.DebugMockBackend {
-		expectedEpoch := epochtime.EpochTime(block.Height / q.epochtimeParams.Interval)
-		if expectedEpoch != epoch {
-			q.logger.Error("Invalid epoch",
-				"expected", expectedEpoch,
-				"epoch", epoch,
-				"height", block.Height,
-				"epoch_interval", q.epochtimeParams.Interval,
-			)
-			return fmt.Errorf("Invalid epoch: %d", epoch)
-		}
-	}
-
 	txs, err := q.consensus.GetTransactions(ctx, height)
 	if err != nil {
 		return fmt.Errorf("GetTransactions at height %d: %w", height, err)
@@ -246,6 +221,7 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 			len(txsWithRes.Transactions), len(txsWithRes.Results),
 		)
 	}
+	q.logger.Debug("Transactions", len(txsWithRes.Transactions))
 
 	var txEvents []*results.Event
 	for txIdx, res := range txsWithRes.Results {
@@ -268,8 +244,6 @@ func (q *queries) doConsensusQueries(ctx context.Context, rng *rand.Rand, height
 
 	q.logger.Debug("Consensus queries done",
 		"height", height,
-		"epoch", epoch,
-		"block", block,
 	)
 
 	return nil
@@ -428,100 +402,6 @@ func (q *queries) doRegistryQueries(ctx context.Context, rng *rand.Rand, height 
 	return nil
 }
 
-// doStakingQueries does staking queries at the provided height.
-func (q *queries) doStakingQueries(ctx context.Context, rng *rand.Rand, height int64) error {
-	q.logger.Debug("Doing staking queries",
-		"height", height,
-	)
-
-	total, err := q.staking.TotalSupply(ctx, height)
-	if err != nil {
-		return fmt.Errorf("staking.TotalSupply: %w", err)
-	}
-
-	commonPool, err := q.staking.CommonPool(ctx, height)
-	if err != nil {
-		return fmt.Errorf("staking.CommonPool: %w", err)
-	}
-
-	lastBlockFees, err := q.staking.LastBlockFees(ctx, height)
-	if err != nil {
-		return fmt.Errorf("staking.LastBLockFees: %w", err)
-	}
-
-	thKind := staking.ThresholdKind(rng.Intn(int(staking.KindMax)))
-	threshhold, err := q.staking.Threshold(ctx, &staking.ThresholdQuery{
-		Height: height,
-		Kind:   thKind,
-	})
-	if err != nil {
-		return fmt.Errorf("staking.Treshold: %w", err)
-	}
-	expected := q.stakingParams.Thresholds[thKind]
-	if threshhold.Cmp(&expected) != 0 {
-		q.logger.Error("Invalid treshold",
-			"expected", expected,
-			"threshold", threshhold,
-			"height", height,
-		)
-		return fmt.Errorf("Invalid treshold")
-	}
-
-	addresses, err := q.staking.Addresses(ctx, height)
-	if err != nil {
-		return fmt.Errorf("staking.Addresses: %w", err)
-	}
-
-	// Make sure total supply matches sum of all balances and fees.
-	var accSum, totalSum quantity.Quantity
-	for _, addr := range addresses {
-		acc, err := q.staking.Account(ctx, &staking.OwnerQuery{Owner: addr, Height: height})
-		if err != nil {
-			q.logger.Error("Error querying AcccountInfo",
-				"height", height,
-				"address", addr,
-				"err", err,
-			)
-			return fmt.Errorf("staking.Account: %w", err)
-		}
-		_ = accSum.Add(&acc.General.Balance)
-		_ = accSum.Add(&acc.Escrow.Active.Balance)
-		_ = accSum.Add(&acc.Escrow.Debonding.Balance)
-	}
-	_ = totalSum.Add(commonPool)
-	_ = totalSum.Add(lastBlockFees)
-	_ = totalSum.Add(&accSum)
-
-	if total.Cmp(&totalSum) != 0 {
-		q.logger.Error("Staking total supply mismatch",
-			"height", height,
-			"common_pool", commonPool,
-			"last_block_fees", lastBlockFees,
-			"accounts_sum", accSum,
-			"total_sum", totalSum,
-			"total", total,
-			"n_addresses", len(addresses),
-		)
-		return fmt.Errorf("staking total supply mismatch")
-	}
-
-	// Events.
-	_, grr := q.staking.GetEvents(ctx, height)
-	if grr != nil {
-		return fmt.Errorf("GetEvents error at height %d: %w", height, grr)
-	}
-
-	q.logger.Debug("Done staking queries",
-		"height", height,
-		"total", total,
-		"common_pool", commonPool,
-		"last_block_fees", lastBlockFees,
-		"threshold", threshhold,
-	)
-
-	return nil
-}
-
 // doRuntimeQueries does runtime queries at a random round.
 func (q *queries) doRuntimeQueries(ctx context.Context, rng *rand.Rand) error {
 	q.logger.Debug("Doing runtime queries")
@@ -643,50 +523,21 @@ func (q *queries) doQueries(ctx context.Context, rng *rand.Rand) error {
 
 	// Determine the earliest height that we can query.
 	earliestHeight := int64(1)
-	if numKept := viper.GetInt64(CfgConsensusNumKeptVersions); numKept < block.Height {
+	if numKept := viper.GetInt64(CfgConsensusNumKeptVersions); numKept != 0 && numKept < block.Height {
 		earliestHeight = block.Height - numKept
 	}
 
 	// Select height at which queries should be done. Earliest and latest
 	// heights are special cased with increased probability to be selected.
-	var height int64
-	p := rng.Float32()
-	switch {
-	case p < queriesEarliestHeightRatio:
-		height = earliestHeight
-	case p < queriesEarliestHeightRatio+queriesLatestHeightRatio:
-		height = block.Height
-	default:
-		// [earliestHeight, block.Height]
-		height = rng.Int63n(block.Height-earliestHeight+1) + earliestHeight
-	}
-
-	q.logger.Debug("Doing queries",
-		"height", height,
-		"height_latest", block.Height,
-	)
-
-	if err := q.doControlQueries(ctx, rng); err != nil {
-		return fmt.Errorf("control queries error: %w", err)
-	}
-	if err := q.doConsensusQueries(ctx, rng, height); err != nil {
-		return fmt.Errorf("consensus queries error: %w", err)
-	}
-	if err := q.doSchedulerQueries(ctx, rng, height); err != nil {
-		return fmt.Errorf("scheduler queries error: %w", err)
-	}
-	if err := q.doRegistryQueries(ctx, rng, height); err != nil {
-		return fmt.Errorf("registry queries error: %w", err)
-	}
-	if err := q.doStakingQueries(ctx, rng, height); err != nil {
-		return fmt.Errorf("staking queries error: %w", err)
-	}
-	if err := q.doRuntimeQueries(ctx, rng); err != nil {
-		return fmt.Errorf("runtime queries error: %w", err)
+	height := block.Height
+	for i := earliestHeight; i < height; i++ {
+		if err := q.doConsensusQueries(ctx, rng, i); err != nil {
+			return fmt.Errorf("consensus queries error: %w", err)
+		}
 	}
 
 	q.logger.Debug("Queries done",
-		"height", height,
+		"earliest_height", earliestHeight,
 		"height_latest", block.Height,
 	)
 
