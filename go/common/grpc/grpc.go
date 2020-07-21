@@ -185,6 +185,76 @@ func (l *grpcLogAdapter) unaryLogger(ctx context.Context, req interface{}, info 
 	return
 }
 
+func (l *grpcLogAdapter) unaryClientLogger(ctx context.Context,
+	method string,
+	req, rsp interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	// TODO: Pull useful things out of ctx for logging.
+	seq := atomic.AddUint64(&l.reqSeq, 1)
+	if l.isDebug {
+		l.reqLogger.Debug("request",
+			"method", method,
+			"req_seq", seq,
+			"req", req,
+		)
+	}
+
+	grpcCalls.With(prometheus.Labels{"call": method}).Inc()
+
+	start := time.Now()
+	err := invoker(ctx, method, req, rsp, cc, opts...)
+	grpcLatency.With(prometheus.Labels{"call": method}).Observe(time.Since(start).Seconds())
+	switch err {
+	case nil:
+		if l.isDebug {
+			l.reqLogger.Debug("request succeeded",
+				"method", method,
+				"req_seq", seq,
+			)
+		}
+	default:
+		l.reqLogger.Error("request failed",
+			"method", method,
+			"req_seq", seq,
+			"err", err,
+		)
+		return err
+	}
+
+	return nil
+}
+
+func (l *grpcLogAdapter) streamClientLogger(ctx context.Context,
+	desc *grpc.StreamDesc,
+	cc *grpc.ClientConn,
+	method string,
+	streamer grpc.Streamer,
+	opts ...grpc.CallOption,
+) (grpc.ClientStream, error) {
+	seq := atomic.AddUint64(&l.streamSeq, 1)
+
+	cs, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		l.reqLogger.Error("stream closed (failure)",
+			"method", method,
+			"stream_seq", seq,
+			"err", err,
+		)
+	}
+
+	csLog := &grpcClientStreamLogger{
+		ClientStream: cs,
+		logAdapter:   l,
+		method:       method,
+		seq:          seq,
+	}
+
+	return csLog, err
+}
+
 func (l *grpcLogAdapter) streamLogger(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	seq := atomic.AddUint64(&l.streamSeq, 1)
 	if l.isDebug {
@@ -225,7 +295,7 @@ func (l *grpcLogAdapter) streamLogger(srv interface{}, ss grpc.ServerStream, inf
 }
 
 func newGrpcLogAdapter(baseLogger *logging.Logger) *grpcLogAdapter {
-	logDebug := viper.GetBool(CfgLogDebug)
+	_ = viper.GetBool(CfgLogDebug)
 
 	// A extra 2 level 2 of unwinding since there's an adapter here,
 	// and there's wrappers in the grpc library.
@@ -239,6 +309,40 @@ func newGrpcLogAdapter(baseLogger *logging.Logger) *grpcLogAdapter {
 		verbosity: 99,
 		isDebug:   true,
 	}
+}
+
+type grpcClientStreamLogger struct {
+	grpc.ClientStream
+
+	logAdapter *grpcLogAdapter
+
+	method string
+	seq    uint64
+}
+
+func (s *grpcClientStreamLogger) SendMsg(m interface{}) error {
+	grpcStreamWrites.With(prometheus.Labels{"call": s.method}).Inc()
+	err := s.ClientStream.SendMsg(m)
+
+	if s.logAdapter.isDebug {
+		switch err {
+		case nil:
+			s.logAdapter.reqLogger.Debug("SendMsg",
+				"method", s.method,
+				"stream_seq", s.seq,
+				"message", m,
+			)
+		default:
+			s.logAdapter.reqLogger.Debug("SendMsg failed",
+				"method", s.method,
+				"stream_seq", s.seq,
+				"message", m,
+				"err", err,
+			)
+		}
+	}
+
+	return err
 }
 
 type grpcStreamLogger struct {
@@ -517,11 +621,19 @@ func NewServer(config *ServerConfig) (*Server, error) {
 
 // Dial creates a client connection to the given target.
 func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	logger := logging.GetLogger("grpc/client")
+	logAdapter := newGrpcLogAdapter(logger)
+
+	grpcGlobalLoggerOnce.Do(func() {
+		grpclog.SetLoggerV2(logAdapter)
+	})
+
 	dialOpts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(&CBORCodec{})),
-		grpc.WithChainUnaryInterceptor(clientUnaryErrorMapper),
-		grpc.WithChainStreamInterceptor(clientStreamErrorMapper),
+		grpc.WithChainUnaryInterceptor(logAdapter.unaryClientLogger, clientUnaryErrorMapper),
+		grpc.WithChainStreamInterceptor(logAdapter.streamClientLogger, clientStreamErrorMapper),
 	}
+
 	dialOpts = append(dialOpts, opts...)
 	return grpc.Dial(target, dialOpts...)
 }
