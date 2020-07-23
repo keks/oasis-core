@@ -2,7 +2,7 @@
 package ledger
 
 import (
-	ledger "github.com/zondax/ledger-oasis-go"
+	ledger "github.com/oasisprotocol/oasis-core-ledger/temp"
 )
 
 const (
