@@ -267,7 +267,7 @@ func (w *Worker) updateStatus(status *api.Status, startedEvent *host.StartedEven
 		}
 
 		if err = signedInitResp.Verify(signingKey); err != nil {
-			return fmt.Errorf("worker/keymanager: failed to validate initialziation response signature: %w", err)
+			return fmt.Errorf("worker/keymanager: failed to validate initialization response signature: %w", err)
 		}
 	}
 
@@ -369,23 +369,42 @@ func (w *Worker) worker() { // nolint: gocyclo
 	// are using us as a key manager.
 	clientRuntimes := make(map[common.Namespace]*clientRuntimeWatcher)
 	clientRuntimesQuitCh := make(chan *clientRuntimeWatcher)
-	rtCh, rtSub, err := w.commonWorker.Consensus.Registry().WatchRuntimes(w.ctx)
-	if err != nil {
-		w.logger.Error("failed to watch runtimes",
-			"err", err,
-		)
-		return
-	}
-	defer rtSub.Close()
 
 	var (
+		err error
+
+		rtCh                <-chan *registry.Runtime
+		rtSub               pubsub.ClosableSubscription
 		hrtEventCh          <-chan *host.Event
 		currentStatus       *api.Status
 		currentStartedEvent *host.StartedEvent
 
 		runtimeID = w.runtime.ID()
 	)
+	defer func() {
+		if rtSub != nil {
+			rtSub.Close()
+		}
+	}()
+
+	refreshRuntimes := true
 	for {
+		// Recreate the WatchRuntimes channel in case we need to refresh
+		// runtimes.
+		if refreshRuntimes {
+			if rtSub != nil {
+				rtSub.Close()
+				rtSub = nil
+			}
+			if rtCh, rtSub, err = w.commonWorker.Consensus.Registry().WatchRuntimes(w.ctx); err != nil {
+				w.logger.Error("failed to watch runtimes",
+					"err", err,
+				)
+				return
+			}
+			refreshRuntimes = false
+		}
+
 		select {
 		case ev := <-hrtEventCh:
 			switch {
@@ -486,6 +505,8 @@ func (w *Worker) worker() { // nolint: gocyclo
 				)
 				continue
 			}
+			// Refresh runtimes.
+			refreshRuntimes = true
 		case <-w.initTickerCh:
 			if currentStatus == nil || currentStartedEvent == nil {
 				continue
@@ -493,17 +514,38 @@ func (w *Worker) worker() { // nolint: gocyclo
 			if err = w.updateStatus(currentStatus, currentStartedEvent); err != nil {
 				w.logger.Error("failed to handle status update", "err", err)
 			}
+			// Refresh runtimes.
+			refreshRuntimes = true
 		case rt := <-rtCh:
+			if currentStatus == nil || currentStatus.Policy == nil {
+				continue
+			}
 			if rt.Kind != registry.KindCompute || rt.KeyManager == nil || !rt.KeyManager.Equal(&runtimeID) {
 				continue
 			}
 			if clientRuntimes[rt.ID] != nil {
 				continue
 			}
-
 			w.logger.Info("seen new runtime using us as a key manager",
 				"runtime_id", rt.ID,
 			)
+
+			// Check policy document if runtime is allowed to query.
+			var found bool
+			for _, enc := range currentStatus.Policy.Policy.Enclaves {
+				for pRt := range enc.MayQuery {
+					if rt.ID.Equal(&pRt) {
+						found = true
+					}
+				}
+			}
+			if !found {
+				w.logger.Debug("runtime not found in keymanager policy",
+					"runtime_id", rt.ID,
+					"status", currentStatus,
+				)
+				continue
+			}
 
 			runtimeUnmg, err := w.commonWorker.RuntimeRegistry.NewUnmanagedRuntime(w.ctx, rt.ID)
 			if err != nil {
